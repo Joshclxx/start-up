@@ -51,13 +51,81 @@ function getReadTime(content: string): string {
   return `${minutes} min read`;
 }
 
+// --- GitHub commit helper (for Vercel production) ---
+async function commitToGitHub(
+  filePath: string,
+  content: string,
+  commitMessage: string
+) {
+  const token = process.env.GITHUB_TOKEN;
+  const repo = process.env.GITHUB_REPO; // e.g. "Joshclxx/start-up"
+  if (!token || !repo) {
+    throw new Error("GITHUB_TOKEN or GITHUB_REPO not configured");
+  }
+
+  const apiBase = `https://api.github.com/repos/${repo}/contents/${filePath}`;
+
+  // 1. Get the current file SHA (required for updates)
+  const existing = await fetch(apiBase, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const existingData = await existing.json();
+  const sha = existingData.sha;
+
+  // 2. Commit the updated file
+  const res = await fetch(apiBase, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      message: commitMessage,
+      content: Buffer.from(content).toString("base64"),
+      sha,
+      branch: "main",
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(`GitHub API error: ${JSON.stringify(err)}`);
+  }
+
+  return res.json();
+}
+
+// --- Serialize a post into the TS source format ---
+function serializePost(post: {
+  slug: string;
+  title: string;
+  excerpt: string;
+  content: string;
+  date: string;
+  author: string;
+  tags: string[];
+  readTime: string;
+}): string {
+  return `  {
+    slug: ${JSON.stringify(post.slug)},
+    title: ${JSON.stringify(post.title)},
+    excerpt: ${JSON.stringify(post.excerpt)},
+    content: ${JSON.stringify(post.content)},
+    date: ${JSON.stringify(post.date)},
+    author: ${JSON.stringify(post.author)},
+    tags: ${JSON.stringify(post.tags)},
+    readTime: ${JSON.stringify(post.readTime)},
+  },`;
+}
+
 export async function POST(request: Request) {
   try {
-    // Verify secret for cron security
-    const { searchParams } = new URL(request.url);
-    const secret = searchParams.get("secret");
-    if (secret !== process.env.CRON_SECRET && process.env.CRON_SECRET) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    // Verify Vercel cron secret in production
+    if (process.env.CRON_SECRET) {
+      const authHeader = request.headers.get("authorization");
+      if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      }
     }
 
     const apiKey = process.env.GEMINI_API_KEY;
@@ -120,29 +188,54 @@ Respond in this exact JSON format (no markdown wrapping, just raw JSON):
       readTime: getReadTime(parsed.content),
     };
 
-    // Read existing blog data file and append new post
-    const blogDataPath = path.join(process.cwd(), "data", "blog.ts");
-    let fileContent = fs.readFileSync(blogDataPath, "utf-8");
+    const blogDataPath = "data/blog.ts";
+    const isVercel = !!process.env.VERCEL;
 
-    // Serialize the new post
-    const postEntry = `  {
-    slug: ${JSON.stringify(newPost.slug)},
-    title: ${JSON.stringify(newPost.title)},
-    excerpt: ${JSON.stringify(newPost.excerpt)},
-    content: ${JSON.stringify(newPost.content)},
-    date: ${JSON.stringify(newPost.date)},
-    author: ${JSON.stringify(newPost.author)},
-    tags: ${JSON.stringify(newPost.tags)},
-    readTime: ${JSON.stringify(newPost.readTime)},
-  },`;
+    if (isVercel) {
+      // --- PRODUCTION (Vercel): commit to GitHub → triggers redeploy ---
+      // Fetch current file from GitHub
+      const token = process.env.GITHUB_TOKEN;
+      const repo = process.env.GITHUB_REPO;
+      if (!token || !repo) {
+        return NextResponse.json(
+          { error: "GITHUB_TOKEN or GITHUB_REPO not set" },
+          { status: 500 }
+        );
+      }
 
-    // Insert at the beginning of the array (after the opening bracket)
-    fileContent = fileContent.replace(
-      /export const blogPosts: BlogPost\[\] = \[\n/,
-      `export const blogPosts: BlogPost[] = [\n${postEntry}\n`
-    );
+      const apiUrl = `https://api.github.com/repos/${repo}/contents/${blogDataPath}`;
+      const existing = await fetch(apiUrl, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const existingData = await existing.json();
+      const currentContent = Buffer.from(
+        existingData.content,
+        "base64"
+      ).toString("utf-8");
 
-    fs.writeFileSync(blogDataPath, fileContent, "utf-8");
+      // Inject new post at the top of the array
+      const postEntry = serializePost(newPost);
+      const updatedContent = currentContent.replace(
+        /export const blogPosts: BlogPost\[\] = \[\n/,
+        `export const blogPosts: BlogPost[] = [\n${postEntry}\n`
+      );
+
+      await commitToGitHub(
+        blogDataPath,
+        updatedContent,
+        `📝 Auto-generate blog: ${newPost.title}`
+      );
+    } else {
+      // --- LOCAL DEV: write directly to filesystem ---
+      const fullPath = path.join(process.cwd(), blogDataPath);
+      let fileContent = fs.readFileSync(fullPath, "utf-8");
+      const postEntry = serializePost(newPost);
+      fileContent = fileContent.replace(
+        /export const blogPosts: BlogPost\[\] = \[\n/,
+        `export const blogPosts: BlogPost[] = [\n${postEntry}\n`
+      );
+      fs.writeFileSync(fullPath, fileContent, "utf-8");
+    }
 
     return NextResponse.json({
       success: true,
@@ -165,7 +258,7 @@ Respond in this exact JSON format (no markdown wrapping, just raw JSON):
   }
 }
 
-// GET handler to manually trigger (for testing)
+// GET handler for manual testing
 export async function GET(request: Request) {
   return POST(request);
 }
